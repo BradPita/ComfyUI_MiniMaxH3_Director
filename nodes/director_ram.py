@@ -91,7 +91,8 @@ class MiniMaxH3DirectorRAM(MiniMaxH3Director):
         " per-segment staging cache (decoded frames + AV latents + audio) lives in"
         " memory instead of output/minimax_seg_cache/, so a re-run inside the same"
         " ComfyUI session needs no disk read, no FFV1 decode and no re-encode."
-        " Cost: ~0.16 GB RAM per 5s 0.4MP segment (LRU budget, default 8 GB), and"
-        " the cache does not survive a ComfyUI restart. Intended for 64GB RAM and"
-        " above; use MiniMaxH3Director if you need the cache to persist."
+        " Cost: ~0.16 GB RAM per 5s 0.4MP segment (LRU budget, default 8 GB)."
+        " Reads always come from RAM; ram_cache_spill_to_disk can mirror writes to"
+        " disk in the background so a restart resumes instead of re-sampling."
+        " Intended for 64GB RAM and above."
     )
