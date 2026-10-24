@@ -14,10 +14,26 @@ import { collectSemanticBridgeWitness } from "./minimax_semantic_bridge.js";
 const REFINE_CLASS = "MiniMaxH3DirectorRefine";
 const SELFLIFT_CLASS = "MiniMaxH3DirectorSelfLift";
 const SEMANTIC_BRIDGE_CLASS = "MiniMaxH3DirectorSemanticBridge";
-const DIRECTOR_CLASSES = new Set(["MiniMaxH3Director", "ComfyMiniMaxH3Director"]);
+/** RAM-staging Director variant: same UI, in-process segment cache. */
+const RAM_DIRECTOR_CLASS = "MiniMaxH3DirectorRAM";
+const DIRECTOR_CLASSES = new Set([
+    "MiniMaxH3Director",
+    "ComfyMiniMaxH3Director",
+    RAM_DIRECTOR_CLASS,
+]);
 const CACHE_STATUS_WIDGET = "first_pass_cache_status";
 const FOLLOW_DIRECTOR_ASPECT = "跟随导演台";
 const PACKER_CLASSES = new Set([SELFLIFT_CLASS, SEMANTIC_BRIDGE_CLASS]);
+
+/**
+ * Which staging backend the backend routes must look at.
+ * Must match `resolve_segment_cache_key(..., backend=...)` in the executor,
+ * otherwise the panel inspects the disk cache of a RAM node (always empty).
+ */
+function directorCacheBackend(director) {
+    const cls = director?.comfyClass || director?.type || "";
+    return cls === RAM_DIRECTOR_CLASS ? "ram" : "disk";
+}
 
 function isRefineNode(node) {
     const cls = node?.comfyClass || node?.type || "";
@@ -570,6 +586,8 @@ function cacheStatusPayload(director, refine) {
         // 缓存目录名：导演台「缓存文件夹名」留空时后端回退节点 id。这里必须和
         // 执行层用同一份取值，否则状态面板会去看另一个目录。
         cache_name: String(directorValue(director, "cache_name", "")),
+        // 暂存后端：RAM 变体（64GB RAM and above）走内存暂存，key 带 ram: 前缀。
+        backend: directorCacheBackend(director),
         // Keep the graph-wired external-group witness current: the status route
         // runs on the backend where i2v_groups / r2v_groups links are invisible.
         timeline_data: injectExternalGroupsWitness(
@@ -807,6 +825,7 @@ async function clearSegmentCache(node) {
             body: JSON.stringify({
                 node_id: String(director.id),
                 cache_name: String(directorValue(director, "cache_name", "")),
+                backend: directorCacheBackend(director),
                 kind: "all",
             }),
         });

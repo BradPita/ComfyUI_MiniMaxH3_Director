@@ -44,6 +44,33 @@ Reference-audio slots can select an existing video or a local audio/video file. 
 
 `Export source to source_images` populates only the separate `source_images` output; it does not change `images`. Connect `source_images` to a preview or video compositor. Decode failures are reported explicitly and emit a neutral placeholder instead of generated frames.
 
+### RAM staging · `MiniMaxH3Director (64GB RAM and above)`
+
+Same Director, but the per-segment staging cache lives in **process memory**
+instead of `output/minimax_seg_cache/` (node type `MiniMaxH3DirectorRAM`).
+See [`docs/ram-cache.md`](docs/ram-cache.md) for the cost model and A/B setup.
+
+| | `MiniMaxH3Director` | `(64GB RAM and above)` |
+| --- | --- | --- |
+| Staging location | `output/minimax_seg_cache/` | process RAM (LRU budget, 8 GB default) |
+| RAM per segment | — | ~0.17 GB (0.4MP / 124 frames) |
+| After a restart | cache survives | **gone, re-samples** |
+| Staging cost / segment | FFV1 or torch.save codec + disk I/O (~0.3–1.0 s) | one tensor conversion |
+| `cache_frames_codec` | honoured | not used (no codec) |
+| Cache key | `<name>_<nodeid>` | `ram:<name>_<nodeid>` (never shared) |
+
+* Budget widget `ram_cache_budget_gb` sits at the bottom of the *Performance*
+  group; `MINIMAX_DIRECTOR_RAM_CACHE_GB` sets the default. Clamped to 1–512 GiB,
+  LRU-evicted per segment.
+* Both nodes can coexist in one graph for comparison; the first-pass cache panel
+  and "clear segment cache" follow the node type.
+* Time staging on your own hardware (no sampling needed):
+  `python tools/bench_ram_staging.py --segments 5`
+* Staging is only 1–3% of a segment's wall time, so RAM staging **does not make
+  sampling faster**. Its win is on slow disks, same-session re-runs, and
+  continuity / refine read-back. For an overall speed-up change steps,
+  resolution or the refine strategy instead.
+
 ## Director pack (script + media)
 
 Toolbar **Import pack / Export pack** writes `*.mmxpack.zip`. Paths are ASCII only and match the English UI (independent of the current UI language).

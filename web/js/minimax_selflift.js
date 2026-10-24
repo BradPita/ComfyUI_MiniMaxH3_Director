@@ -3,7 +3,11 @@
 import { app } from "../../scripts/app.js";
 
 const SELFLIFT_CLASS = "MiniMaxH3DirectorSelfLift";
-const DIRECTOR_CLASSES = new Set(["MiniMaxH3Director", "ComfyMiniMaxH3Director"]);
+const DIRECTOR_CLASSES = new Set([
+    "MiniMaxH3Director",
+    "ComfyMiniMaxH3Director",
+    "MiniMaxH3DirectorRAM", // RAM-staging variant, same UI
+]);
 const BYPASS_MODES = new Set([2, 4]);
 
 function isSelfLiftNode(node) {

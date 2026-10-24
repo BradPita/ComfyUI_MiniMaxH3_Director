@@ -528,9 +528,13 @@ async def minimax_first_pass_cache_status(request):
 
     # Same key the executor uses: <cache_name>_<node_id> when 缓存文件夹名 is
     # filled, node id otherwise. Never trust the raw string as a path segment.
+    # backend="ram" addresses the in-process RAM staging store of the
+    # 「(64GB RAM and above)」Director variant (key gets a ram: prefix).
     from .segment_cache import resolve_segment_cache_key
 
-    cache_key = resolve_segment_cache_key(body.get("cache_name"), node_id)
+    cache_key = resolve_segment_cache_key(
+        body.get("cache_name"), node_id, backend=body.get("backend")
+    )
     if not cache_key:
         return web.Response(status=400, text="Invalid segment cache name.")
 
@@ -605,7 +609,9 @@ async def minimax_clear_segment_cache(request):
     try:
         from .segment_cache import clear_segment_cache, resolve_segment_cache_key
 
-        cache_key = resolve_segment_cache_key(body.get("cache_name"), node_id)
+        cache_key = resolve_segment_cache_key(
+            body.get("cache_name"), node_id, backend=body.get("backend")
+        )
         if not cache_key:
             return web.Response(status=400, text="Invalid segment cache name.")
 

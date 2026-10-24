@@ -41,6 +41,31 @@
 > 同一个名字配上不同节点 id 会分开。复制工作流后节点 id 通常还是原来的，名字也相同就会继续共用一个目录，要隔开就改名字。
 > 名字会自动过滤 `/ \ : * ? " < > |` 与 Windows 保留名（`CON`/`NUL`…），最长 64 字符。
 
+### 内存暂存 · `MiniMaxH3Director (64GB RAM and above)`
+
+同一套导演台，分段暂存放在**进程内存**里，不落盘。节点类型 `MiniMaxH3DirectorRAM`，
+推荐先读 [`docs/ram-cache.md`](docs/ram-cache.md)（含开销换算与 A/B 方法）。
+
+| | 主节点 `MiniMaxH3Director` | `(64GB RAM and above)` |
+| --- | --- | --- |
+| 暂存位置 | `output/minimax_seg_cache/` | 进程内存（LRU 预算，默认 8 GB） |
+| 每段内存 | — | ~0.17 GB（0.4MP / 124 帧） |
+| 重启后 | 缓存还在 | **失效，需重新采样** |
+| 每段暂存开销 | FFV1/torch.save 编解码 + 磁盘 I/O（约 0.3–1.0 s） | 仅一次张量转换 |
+| 帧编码选项 | `cache_frames_codec` 生效 | 不适用（无编解码） |
+| 缓存 key | `<名字>_<节点id>` | `ram:<名字>_<节点id>`（与主节点不共享） |
+
+* 预算控件 `ram_cache_budget_gb` 在性能组最下方；也可用环境变量
+  `MINIMAX_DIRECTOR_RAM_CACHE_GB` 设默认值。夹在 1–512 GiB，按段 LRU 淘汰
+  （单段就超预算时保留刚写入的那段，超出量最多一段）。
+* 两者可以同时存在同一张图里，方便对比；「先确认一采」「清空分段缓存」都会
+  按节点类型看对应的暂存。
+* 量化暂存本身耗时（不需要跑采样）：
+  `python tools/bench_ram_staging.py --segments 5`
+* 暂存只占单段总时长的 1–3%，**它不会让采样变快**；如果目标是整体提速，
+  优先动步数 / 分辨率 / 二采策略。RAM 暂存的收益在慢盘、同进程重跑、
+  段间衔接与二采回读上。
+
 **输出：** `images` → `audio` → `fps` → `frame_count` → `source_images` → `report` → `images_pre_refine`
 
 > CLIP Loader 的 **type 必须选 `minimax`**（Qwen3-VL）。  

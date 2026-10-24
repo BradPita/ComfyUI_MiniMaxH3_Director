@@ -158,6 +158,17 @@ const DIRECTOR_MIN_WIDTH = 900;
 const COMFY_UPLOAD_SOFT_LIMIT = 95 * 1024 * 1024;
 const MINIMAX_CHUNK_SIZE = 8 * 1024 * 1024;
 
+/**
+ * Every node type that carries the Director timeline UI.
+ * `MiniMaxH3DirectorRAM` is the RAM-staging variant: same UI, same widgets,
+ * in-process segment cache instead of output/minimax_seg_cache/.
+ */
+const DIRECTOR_NODE_CLASSES = new Set([
+    "MiniMaxH3Director",
+    "ComfyMiniMaxH3Director",
+    "MiniMaxH3DirectorRAM",
+]);
+
 /** Segment continuity is opt-in; default off unless explicitly enabled in output. */
 function isContinuityEnabled(output) {
     if (!output) return false;
@@ -1761,6 +1772,8 @@ const PERF_WIDGET_ORDER = [
     // configure 阶段按位置塞 widgets_values 时会整体错位一位 —— 实测它抢到了
     // BDGROUP「性能」的值。
     "cache_name",
+    // RAM 变体（64GB RAM and above）多一个预算控件，跟着性能组一起排。
+    "ram_cache_budget_gb",
 ];
 
 function moveDirectorPerfWidgetsBeforeTimeline(node) {
@@ -13263,12 +13276,12 @@ function clearAllDirectorRunStatus() {
 /** Old workflows may still list removed output slots (e.g. segment_images). */
 function isMiniMaxH3DirectorNode(node) {
     const cls = node?.comfyClass || node?.type || "";
-    return cls === "MiniMaxH3Director" || cls === "ComfyMiniMaxH3Director";
+    return DIRECTOR_NODE_CLASSES.has(cls);
 }
 
 function isDirectorNodeDef(nodeType, nodeData) {
     const cls = nodeType?.comfyClass || nodeData?.name || "";
-    return cls === "MiniMaxH3Director" || cls === "ComfyMiniMaxH3Director";
+    return DIRECTOR_NODE_CLASSES.has(cls);
 }
 
 function stripDeprecatedDirectorOutputs(node) {

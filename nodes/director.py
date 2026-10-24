@@ -47,6 +47,12 @@ def director_timeline_required_inputs() -> dict:
 class MiniMaxH3Director:
     """In-node timeline Director using ComfyUI official MiniMax H3 pipeline."""
 
+    # Segment staging backend. "disk" = output/minimax_seg_cache/.
+    # Subclasses override to "ram" (see nodes/director_ram.py).
+    CACHE_BACKEND = "disk"
+    # RAM staging budget in GiB; 0 = env / default (only used when CACHE_BACKEND="ram").
+    RAM_CACHE_BUDGET_GB = 0
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -244,8 +250,12 @@ class MiniMaxH3Director:
 
         # Must resolve the same directory the executor will read/write, otherwise
         # the confirm-first-pass hold never sees its own written .pre cache.
+        # RAM-staging subclasses must resolve the same ram: key or the hold never
+        # observes its own slot (RAM slots are not visible on disk).
         return first_pass_cache_disk_signature(
-            resolve_segment_cache_key(cache_name, unique_id)
+            resolve_segment_cache_key(
+                cache_name, unique_id, backend=getattr(cls, "CACHE_BACKEND", "disk")
+            )
         )
 
     RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "IMAGE", "STRING", "IMAGE", "IMAGE")
@@ -337,6 +347,10 @@ class MiniMaxH3Director:
         )
         codec = str(cache_frames_codec or "raw").strip().lower()
         plan.cache_frames_codec = "ffv1" if codec == "ffv1" else "raw"
+        plan.cache_backend = (
+            "ram" if str(getattr(self, "CACHE_BACKEND", "disk")).lower() == "ram" else "disk"
+        )
+        plan.ram_cache_gb = max(0, int(getattr(self, "RAM_CACHE_BUDGET_GB", 0) or 0))
 
         try:
             combined, segment_outputs, segment_audios, report, export_frame_counts, pre_combined, pre_segments, held_for_confirmation, pre_face_combined, pre_face_segments = (

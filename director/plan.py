@@ -282,6 +282,10 @@ class DirectorPlan:
     export_mode: str = "all"  # "all" | "segments"
     # Pixel-frame cache codec. "raw" = uint8 .pt; "ffv1" = lossless mkv.
     cache_frames_codec: str = "raw"
+    # Segment staging backend: "disk" = output/minimax_seg_cache/, "ram" = the
+    # in-process store in director/segment_cache_ram.py (opt-in node).
+    cache_backend: str = "disk"
+    ram_cache_gb: int = 0  # 0 = use the RAM store default / env
     run_indices: frozenset[int] | None = None  # None = run all segments
     continuity_enabled: bool = False
     continuity_overlap_frames: int = 0

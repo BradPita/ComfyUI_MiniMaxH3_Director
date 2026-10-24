@@ -70,6 +70,7 @@ from .h3_motion_context import (
     trim_context_prefix,
     trim_export_tail,
 )
+from . import segment_cache_ram as ram_cache
 from .segment_cache import (
     load_first_pass_av_latent,
     load_first_pass_cache,
@@ -442,9 +443,17 @@ def execute_director_plan_core(
 ]:
     """Process every segment with MiniMax H3 conditioning + single-stage sampling."""
     # 缓存目录 key：填了「缓存文件夹名」用 <名字>_<节点id>，留空则只有节点 id（老工作流行为不变）。
+    # 「(64GB RAM and above)」节点用 backend="ram"，key 变成 ram:<...>，落到进程内内存暂存。
     # 进度上报必须继续用真实节点 id —— 前端是按画布节点 id 认进度条的。
     progress_node_id = node_id
-    node_id = resolve_segment_cache_key(cache_name, node_id)
+    backend = str(getattr(plan, "cache_backend", "disk") or "disk").strip().lower()
+    node_id = resolve_segment_cache_key(
+        cache_name, node_id, backend="ram" if backend == "ram" else "disk"
+    )
+    ram_staging = ram_cache.is_ram_key(node_id)
+    if ram_staging:
+        plan.cache_frames_codec = "raw"  # RAM stores live tensors: no codec involved
+        ram_cache.configure(getattr(plan, "ram_cache_gb", 0))
     plan.sample_seed = int(seed)
     plan.sample_cfg = float(cfg)
     plan.sample_steps = int(steps)
@@ -513,6 +522,13 @@ def execute_director_plan_core(
     plan.segment_mp4_run_dir = str(mp4_run_dir) if mp4_run_dir is not None else None
     if mp4_run_dir is not None:
         reports.append(f"Segment mp4 export dir: {mp4_run_dir}")
+    if ram_staging:
+        _ram_stats = ram_cache.stats()
+        reports.append(
+            f"Staging: 内存暂存（RAM）— 预算 {_ram_stats['budget_gb']} GB，"
+            f"已用 {_ram_stats['bytes'] / (1024 ** 3):.2f} GB / "
+            f"{_ram_stats['entries']} 个文件。进程退出即失效；帧编码选项不适用。"
+        )
     if live_tae_preview:
         reports.append("Live preview: ON — 采样中 TAE 动态预览（成片看下游 CreateVideo / SaveVideo）。")
     else:

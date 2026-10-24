@@ -6,6 +6,12 @@ older versions as raw uint8 ``torch.save`` (``seg_XXXX.pt``) are still *read*,
 and are deleted as soon as that slot is written again. Nothing else about the
 layout changed (``.av.pt`` / ``.audio.pt`` / ``.handoff.json`` / ``.meta.json``).
 
+**RAM staging (opt-in).** ``Director (64GB RAM and above)`` resolves its cache
+key with ``backend="ram"``, which yields a ``ram:``-prefixed key. Every function
+here then talks to :mod:`..director.segment_cache_ram` instead of
+``output/minimax_seg_cache/`` — same file names, same fingerprints, same
+prune/clear/inspect behaviour, zero serialization. See ``docs/ram-cache.md``.
+
 Cache is best-effort: write failures (cloud RO mounts, same-name overwrite
 blocks, full disks) must never abort the main generation run.
 """
@@ -25,6 +31,7 @@ import torch
 import folder_paths
 
 from ..lib.frames_ffv1 import FRAMES_SUFFIX, decode_frames_ffv1, encode_frames_ffv1
+from . import segment_cache_ram as _ramcache
 from .h3_latent_continue import CONTINUE_PIPELINE_ID, clamp_seam_min_mask
 from .h3_motion_context import CONTINUITY_PIPELINE_ID, trim_context_prefix, trim_export_tail
 from .plan import DirectorPlan, SegmentPlan, resolve_ref_image_size
@@ -177,14 +184,24 @@ def normalize_cache_name(raw: Any) -> str:
     return text[:MAX_CACHE_NAME_LEN]
 
 
-def resolve_segment_cache_key(cache_name: Any, node_id: Any) -> str:
-    """Disk cache directory name.
+def resolve_segment_cache_key(
+    cache_name: Any,
+    node_id: Any,
+    *,
+    backend: Any = None,
+) -> str:
+    """Cache key: disk directory name, or a ``ram:``-prefixed RAM store key.
 
     Empty ``cache_name`` keeps the legacy directory ``<node_id>``.
     A usable name becomes ``<name>_<node_id>``: the same label on two Director
     nodes stays split by node id. A copied workflow still shares the folder when
     both the name and the node id match. Missing node id falls back to the name
     alone so a cache can still be addressed.
+
+    ``backend="ram"`` prefixes the key with :data:`segment_cache_ram.RAM_KEY_PREFIX`
+    (``ram:``). ``:`` can never come out of :func:`normalize_cache_name` and is
+    rejected by :func:`_sanitize_dir_token`, so a RAM key can never alias a disk
+    directory. Same name / id on the two backends = two independent stores.
     """
     try:
         node = str(node_id or "").strip()
@@ -192,8 +209,12 @@ def resolve_segment_cache_key(cache_name: Any, node_id: Any) -> str:
         node = ""
     name = normalize_cache_name(cache_name)
     if name and node:
-        return f"{name}_{node}"
-    return node or name
+        base = f"{name}_{node}"
+    else:
+        base = node or name
+    if str(backend or "").strip().lower() == "ram":
+        return _ramcache.make_ram_key(base)
+    return base
 
 
 def _sanitize_dir_token(token: Any) -> str:
@@ -213,7 +234,11 @@ def _sanitize_dir_token(token: Any) -> str:
 
 
 def _cache_dir(key: Any) -> Path:
-    """Absolute cache directory for one key. Raises ValueError on a blank/unsafe key."""
+    """Absolute cache directory for one key. Raises ValueError on a blank/unsafe key.
+
+    RAM keys (``ram:...``) are refused here on purpose: ``:`` is forbidden in a
+    directory token, so a RAM key can never silently create a ``output/`` folder.
+    """
     token = _sanitize_dir_token(key)
     if not token:
         raise ValueError(f"unsafe or empty segment cache key: {key!r}")
@@ -222,13 +247,17 @@ def _cache_dir(key: Any) -> Path:
 
 def _cache_dir_or_none(key: Any) -> Path | None:
     """Read-only variant: None instead of raising, so callers skip disk access."""
+    if _ramcache.is_ram_key(key):
+        return _ramcache.root_for(key)
     try:
         return _cache_dir(key)
     except ValueError:
         return None
 
 
-def _cache_root(node_id: str) -> Path | None:
+def _cache_root(node_id: str | None) -> Path | None:
+    if _ramcache.is_ram_key(node_id):
+        return _ramcache.root_for(node_id)
     try:
         root = _cache_dir(node_id)
         root.mkdir(parents=True, exist_ok=True)
@@ -419,12 +448,35 @@ def _atomic_publish(tmp: Path, dest: Path) -> None:
 
 def _write_via_temp(dest: Path, write_fn: Callable[[Path], None]) -> None:
     """Write to a unique temp name in the same folder, then publish to ``dest``."""
+    if isinstance(dest, _ramcache.RamFile):
+        # RAM store: one dict assignment is already atomic — no temp file needed.
+        write_fn(dest)
+        return
     tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
     try:
         write_fn(tmp)
         _atomic_publish(tmp, dest)
     finally:
         _safe_unlink(tmp)
+
+
+def _save_torch(path: Any, payload: Any) -> None:
+    """Write a torch payload into a cache slot.
+
+    Disk: ``torch.save``. RAM: keep the live object (no pickle, no disk I/O) —
+    this is the whole point of the RAM backend, so it must not serialize.
+    """
+    if isinstance(path, _ramcache.RamFile):
+        path.set_object(payload)
+        return
+    torch.save(payload, path)
+
+
+def _load_torch(path: Any, *, weights_only: bool = False, clone: bool = True) -> Any:
+    """Read a torch payload from a cache slot (RAM returns a private copy)."""
+    if isinstance(path, _ramcache.RamFile):
+        return path.get_object(clone=clone)
+    return torch.load(path, map_location="cpu", weights_only=weights_only)
 
 
 def _audio_payload_to_cpu(audio: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -494,9 +546,8 @@ def _load_frames(root: Path, idx: int, *, first_pass: bool) -> torch.Tensor | No
     legacy = _legacy_frames_path(root, idx, first_pass=first_pass)
     if legacy.is_file():
         try:
-            return _frames_from_disk(
-                torch.load(legacy, map_location="cpu", weights_only=True)
-            )
+            # No clone needed: _frames_from_disk builds a fresh float32 tensor.
+            return _frames_from_disk(_load_torch(legacy, weights_only=True, clone=False))
         except Exception as exc:
             log.warning("Failed to load legacy frame cache %s: %s", legacy.name, exc)
             return None
@@ -530,8 +581,13 @@ def _store_segment_frames(
     first_pass: bool,
     plan,
 ) -> None:
-    """Write pixel frames in the plan's codec and drop the other format."""
-    if _frames_codec(plan) == "ffv1":
+    """Write pixel frames in the plan's codec and drop the other format.
+
+    RAM backend: the uint8 tensor is kept as a live object under the ``.pt``
+    name (no FFV1, no torch.save), so ``cache_frames_codec`` has no meaning there
+    and the FFV1 branch is skipped even if the widget says ``ffv1``.
+    """
+    if _frames_codec(plan) == "ffv1" and not isinstance(root, _ramcache.RamRoot):
         fps = float(getattr(plan, "frame_rate", 24) or 24)
         _write_via_temp(
             _frames_path(root, idx, first_pass=first_pass),
@@ -541,7 +597,7 @@ def _store_segment_frames(
         return
     _write_via_temp(
         _legacy_frames_path(root, idx, first_pass=first_pass),
-        lambda p: torch.save(payload, p),
+        lambda p: _save_torch(p, payload),
     )
     _drop_ffv1_frames(root, idx, first_pass=first_pass)
 
@@ -586,7 +642,7 @@ def save_segment_cache(
         )
         if av_latent is not None and isinstance(av_latent, dict) and "samples" in av_latent:
             cpu_latent = _av_latent_to_cpu(av_latent)
-            _write_via_temp(latent_path, lambda p: torch.save(cpu_latent, p))
+            _write_via_temp(latent_path, lambda p: _save_torch(p, cpu_latent))
         if handoff:
             _write_via_temp(
                 handoff_path,
@@ -597,7 +653,7 @@ def save_segment_cache(
             )
         audio_cpu = _audio_payload_to_cpu(audio)
         if audio_cpu is not None:
-            _write_via_temp(audio_path, lambda p: torch.save(audio_cpu, p))
+            _write_via_temp(audio_path, lambda p: _save_torch(p, audio_cpu))
         elif replace_audio:
             # Fresh sample with no waveform — drop stale audio from an older run.
             _safe_unlink(audio_path)
@@ -784,7 +840,7 @@ def load_first_pass_av_latent(
                     return None
                 if not allow_stale:
                     return None
-        payload = torch.load(latent_path, map_location="cpu", weights_only=False)
+        payload = _load_torch(latent_path, weights_only=False)
         if not isinstance(payload, dict) or "samples" not in payload:
             return None
         return payload
@@ -820,7 +876,7 @@ def load_first_pass_low_carry(
                     return None
                 if not allow_stale:
                     return None
-        payload = torch.load(low_path, map_location="cpu", weights_only=False)
+        payload = _load_torch(low_path, weights_only=False)
         if not isinstance(payload, dict) or "samples" not in payload:
             return None
         return payload
@@ -853,7 +909,7 @@ def load_segment_av_latent(
         if stored != expected:
             if _reject_source_stale(stored, expected, seg_index=idx, quiet=True) or not allow_stale:
                 return None
-        payload = torch.load(latent_path, map_location="cpu", weights_only=False)
+        payload = _load_torch(latent_path, weights_only=False)
         if not isinstance(payload, dict) or "samples" not in payload:
             return None
         return payload
@@ -969,7 +1025,7 @@ def load_segment_audio(
     if not audio_path.is_file():
         return None
     try:
-        payload = torch.load(audio_path, map_location="cpu", weights_only=False)
+        payload = _load_torch(audio_path, weights_only=False)
         if not isinstance(payload, dict):
             return None
         wave = payload.get("waveform")
@@ -1008,7 +1064,7 @@ def save_first_pass_cache(
     low_path = root / f"seg_{idx:04d}.pre.low.pt"
     try:
         cpu_latent = _av_latent_to_cpu(av_latent)
-        _write_via_temp(latent_path, lambda p: torch.save(cpu_latent, p))
+        _write_via_temp(latent_path, lambda p: _save_torch(p, cpu_latent))
         text = json.dumps(fp, ensure_ascii=False, sort_keys=True)
         _write_via_temp(meta_path, lambda p: p.write_text(text, encoding="utf-8"))
         if handoff:
@@ -1024,7 +1080,7 @@ def save_first_pass_cache(
             _store_segment_frames(root, idx, payload, first_pass=True, plan=plan)
         if isinstance(low_carry, dict) and "samples" in low_carry:
             cpu_low = _av_latent_to_cpu(low_carry)
-            _write_via_temp(low_path, lambda p: torch.save(cpu_low, p))
+            _write_via_temp(low_path, lambda p: _save_torch(p, cpu_low))
         elif low_path.is_file():
             _safe_unlink(low_path)
         log.debug(
@@ -1163,7 +1219,7 @@ def load_first_pass_cache(
                 diff[:8],
             )
             return None
-        payload = torch.load(latent_path, map_location="cpu", weights_only=False)
+        payload = _load_torch(latent_path, weights_only=False)
         if not isinstance(payload, dict) or "samples" not in payload:
             return None
         frames = None
@@ -1180,7 +1236,7 @@ def load_first_pass_cache(
         low_carry = None
         if low_path.is_file():
             try:
-                loaded_low = torch.load(low_path, map_location="cpu", weights_only=False)
+                loaded_low = _load_torch(low_path, weights_only=False)
                 if isinstance(loaded_low, dict) and "samples" in loaded_low:
                     low_carry = loaded_low
             except Exception as exc:
