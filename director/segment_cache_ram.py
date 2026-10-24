@@ -38,12 +38,16 @@ that needs cleanup: routing is a pure function of the key string.
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
+import queue
 import sys
 import threading
 import time
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Callable
+
+log = logging.getLogger("ComfyUI-MiniMaxH3-Director.director.cache.ram")
 
 RAM_KEY_PREFIX = "ram:"
 DEFAULT_BUDGET_GB = 8.0
@@ -51,6 +55,8 @@ GIB = 1024 * 1024 * 1024
 _BUDGET_ENV = "MINIMAX_DIRECTOR_RAM_CACHE_GB"
 _MIN_BUDGET_GB = 1.0
 _MAX_BUDGET_GB = 512.0
+# Slots that may sit unwritten in the spill queue (≈ 2-3 segments of payloads).
+_SPILL_MAX_PENDING = 6
 
 _LOCK = threading.RLock()
 _STORES: dict[str, "_Store"] = {}
@@ -154,6 +160,101 @@ def reset() -> None:
         _STORES.clear()
         _LRU.clear()
         _TOTAL_BYTES = 0
+
+
+# --------------------------------------------------------------------------- #
+# optional write-behind to disk
+# --------------------------------------------------------------------------- #
+# When enabled, every successful RAM write is also handed to a background worker
+# that persists it under the *base* key (``<name>_<nodeid>``, no ``ram:`` prefix)
+# with the on-disk file layout. Reads always come from RAM, so the spill never
+# slows a run; it only buys cross-restart reuse. Best effort: a full queue or a
+# write error drops the spill, never the run.
+_SPILL_SINK: Callable[[str, str, Any, bool], None] | None = None
+_SPILL_QUEUE: "queue.Queue | None" = None
+_SPILL_THREAD: threading.Thread | None = None
+_SPILL_DROPPED = 0
+
+
+def _spill_worker(sink: Callable[[str, str, Any, bool], None], work: "queue.Queue") -> None:
+    while True:
+        item = work.get()
+        try:
+            if item is None:
+                return
+            base, name, payload, is_text = item
+            try:
+                sink(base, name, payload, is_text)
+            except Exception as exc:  # pragma: no cover - depends on the sink
+                log.debug("RAM spill skipped for %s (%s).", name, exc)
+        finally:
+            work.task_done()
+
+
+def enable_spill(sink: Callable[[str, str, Any, bool], None], *, max_pending: int = _SPILL_MAX_PENDING) -> None:
+    """Mirror every RAM write to ``sink(base_key, name, payload, is_text)``.
+
+    ``sink`` runs on a daemon worker thread; it must be safe to lose writes.
+    """
+    global _SPILL_SINK, _SPILL_QUEUE, _SPILL_THREAD, _SPILL_DROPPED
+    with _LOCK:
+        if _SPILL_SINK is not None and _SPILL_QUEUE is not None:
+            _SPILL_SINK = sink
+            return
+        work: "queue.Queue" = queue.Queue(maxsize=max(1, int(max_pending)))
+        thread = threading.Thread(
+            target=_spill_worker, args=(sink, work), name="mmx-ram-spill", daemon=True
+        )
+        _SPILL_SINK = sink
+        _SPILL_QUEUE = work
+        _SPILL_THREAD = thread
+        _SPILL_DROPPED = 0
+        thread.start()
+
+
+def disable_spill() -> None:
+    """Stop mirroring (in-flight writes still finish; queued ones are dropped)."""
+    global _SPILL_SINK, _SPILL_QUEUE, _SPILL_THREAD
+    with _LOCK:
+        work = _SPILL_QUEUE
+        _SPILL_SINK = None
+        _SPILL_QUEUE = None
+        _SPILL_THREAD = None
+    if work is not None:
+        try:
+            work.put_nowait(None)  # worker exits after the current item
+        except queue.Full:
+            pass
+
+
+def spill_enabled() -> bool:
+    return _SPILL_SINK is not None
+
+
+def spill_stats() -> dict[str, Any]:
+    work = _SPILL_QUEUE
+    return {
+        "enabled": _SPILL_SINK is not None,
+        "pending": work.qsize() if work is not None else 0,
+        "dropped": _SPILL_DROPPED,
+    }
+
+
+def _spill_enqueue(key: str, name: str, payload: Any, is_text: bool) -> None:
+    global _SPILL_DROPPED
+    sink = _SPILL_SINK
+    work = _SPILL_QUEUE
+    if sink is None or work is None:
+        return
+    try:
+        work.put_nowait((base_key(key), name, payload, is_text))
+    except queue.Full:
+        _SPILL_DROPPED += 1
+        if _SPILL_DROPPED == 1:
+            log.warning(
+                "RAM spill queue full; further segment writes go to RAM only "
+                "(disk mirror may be incomplete)."
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -318,6 +419,7 @@ def _put_text(key: str, name: str, text: str) -> None:
         _LRU[(key, name)] = None
         _LRU.move_to_end((key, name))
         _evict_locked(protect=(key, name))
+    _spill_enqueue(key, name, text, True)
 
 
 def _put_object(key: str, name: str, value: Any) -> None:
@@ -331,6 +433,7 @@ def _put_object(key: str, name: str, value: Any) -> None:
         _LRU[(key, name)] = None
         _LRU.move_to_end((key, name))
         _evict_locked(protect=(key, name))
+    _spill_enqueue(key, name, value, False)
 
 
 def _touch_locked(key: str, name: str) -> None:

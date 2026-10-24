@@ -1772,8 +1772,9 @@ const PERF_WIDGET_ORDER = [
     // configure 阶段按位置塞 widgets_values 时会整体错位一位 —— 实测它抢到了
     // BDGROUP「性能」的值。
     "cache_name",
-    // RAM 变体（64GB RAM and above）多一个预算控件，跟着性能组一起排。
+    // RAM 变体（64GB RAM and above）多两个控件：预算 + 后台落盘开关。
     "ram_cache_budget_gb",
+    "ram_cache_spill_to_disk",
 ];
 
 function moveDirectorPerfWidgetsBeforeTimeline(node) {

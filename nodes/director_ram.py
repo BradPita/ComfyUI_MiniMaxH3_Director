@@ -19,6 +19,7 @@ from __future__ import annotations
 from .director import MiniMaxH3Director
 
 _RAM_WIDGET = "ram_cache_budget_gb"
+_SPILL_WIDGET = "ram_cache_spill_to_disk"
 
 
 class MiniMaxH3DirectorRAM(MiniMaxH3Director):
@@ -26,6 +27,7 @@ class MiniMaxH3DirectorRAM(MiniMaxH3Director):
 
     CACHE_BACKEND = "ram"
     RAM_CACHE_BUDGET_GB = 8
+    RAM_CACHE_SPILL = False
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -57,16 +59,30 @@ class MiniMaxH3DirectorRAM(MiniMaxH3Director):
                 ),
             },
         )
+        required[_SPILL_WIDGET] = (
+            "BOOLEAN",
+            {
+                "default": cls.RAM_CACHE_SPILL,
+                "tooltip": (
+                    "顺便落盘（后台线程）：读永远是内存命中，写入同时由后台线程补一份到 "
+                    "output/minimax_seg_cache/（和主节点同一个目录）。"
+                    "好处是关掉 ComfyUI 再开还能续跑；代价是多一遍磁盘写入"
+                    "（不挡采样，但会占 CPU/IO，慢盘上可能拖慢一点）。"
+                    "关掉 = 纯内存，进程退出即失效。"
+                ),
+            },
+        )
         return data
 
     def execute(self, *args, **kwargs):
-        # ComfyUI passes inputs by keyword; the budget is a node-level knob that
-        # the base class reads off the instance (CACHE_BACKEND is set on the class).
+        # ComfyUI passes inputs by keyword; these are node-level knobs that the
+        # base class reads off the instance (CACHE_BACKEND is set on the class).
         budget = kwargs.pop(_RAM_WIDGET, self.RAM_CACHE_BUDGET_GB)
         try:
             self.RAM_CACHE_BUDGET_GB = max(0, int(budget))
         except (TypeError, ValueError):
             self.RAM_CACHE_BUDGET_GB = 8
+        self.RAM_CACHE_SPILL = bool(kwargs.pop(_SPILL_WIDGET, self.RAM_CACHE_SPILL))
         return super().execute(*args, **kwargs)
 
     DESCRIPTION = (

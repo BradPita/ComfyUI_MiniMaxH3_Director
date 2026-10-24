@@ -41,6 +41,13 @@
 > 同一个名字配上不同节点 id 会分开。复制工作流后节点 id 通常还是原来的，名字也相同就会继续共用一个目录，要隔开就改名字。
 > 名字会自动过滤 `/ \ : * ? " < > |` 与 Windows 保留名（`CON`/`NUL`…），最长 64 字符。
 
+**输出：** `images` → `audio` → `fps` → `frame_count` → `source_images` → `report` → `images_pre_refine`
+
+> CLIP Loader 的 **type 必须选 `minimax`**（Qwen3-VL）。  
+> `t2v` / `i2v` / `fl2v` 用 **fl2va** UNET；`r2v` / `v2v` / `rv2v` 用 **ref2va** UNET。
+
+`输出原片到 source_images` 只填充独立的 `source_images` 输出，不会改变主 `images`。请将 `source_images` 另接预览或视频合成节点查看；解码失败时运行报告会明确说明，并输出灰色占位而不会冒充生成画面。
+
 ### 内存暂存 · `MiniMaxH3Director (64GB RAM and above)`
 
 同一套导演台，分段暂存放在**进程内存**里，不落盘。节点类型 `MiniMaxH3DirectorRAM`，
@@ -50,14 +57,16 @@
 | --- | --- | --- |
 | 暂存位置 | `output/minimax_seg_cache/` | 进程内存（LRU 预算，默认 8 GB） |
 | 每段内存 | — | ~0.17 GB（0.4MP / 124 帧） |
-| 重启后 | 缓存还在 | **失效，需重新采样** |
+| 重启后 | 缓存还在 | 默认**失效**；开「顺便落盘」可续跑 |
 | 每段暂存开销 | FFV1/torch.save 编解码 + 磁盘 I/O（约 0.3–1.0 s） | 仅一次张量转换 |
 | 帧编码选项 | `cache_frames_codec` 生效 | 不适用（无编解码） |
 | 缓存 key | `<名字>_<节点id>` | `ram:<名字>_<节点id>`（与主节点不共享） |
 
-* 预算控件 `ram_cache_budget_gb` 在性能组最下方；也可用环境变量
-  `MINIMAX_DIRECTOR_RAM_CACHE_GB` 设默认值。夹在 1–512 GiB，按段 LRU 淘汰
-  （单段就超预算时保留刚写入的那段，超出量最多一段）。
+* 性能组最下方多两个控件：`ram_cache_budget_gb`（预算，夹在 1–512 GiB，按段 LRU
+  淘汰；单段就超预算时保留刚写入的那段）与 `ram_cache_spill_to_disk`
+  （**后台落盘**：读永远走内存，写入由后台线程补一份到
+  `output/minimax_seg_cache/<名字>_<节点id>/`，关掉 ComfyUI 还能续跑；队列满就丢落盘、
+  绝不阻塞生成）。预算默认值也可用环境变量 `MINIMAX_DIRECTOR_RAM_CACHE_GB`。
 * 两者可以同时存在同一张图里，方便对比；「先确认一采」「清空分段缓存」都会
   按节点类型看对应的暂存。
 * 量化暂存本身耗时（不需要跑采样）：
@@ -66,12 +75,13 @@
   优先动步数 / 分辨率 / 二采策略。RAM 暂存的收益在慢盘、同进程重跑、
   段间衔接与二采回读上。
 
-**输出：** `images` → `audio` → `fps` → `frame_count` → `source_images` → `report` → `images_pre_refine`
+### 分块 + 段间引导 keep-mask（已修复）
 
-> CLIP Loader 的 **type 必须选 `minimax`**（Qwen3-VL）。  
-> `t2v` / `i2v` / `fl2v` 用 **fl2va** UNET；`r2v` / `v2v` / `rv2v` 用 **ref2va** UNET。
-
-`输出原片到 source_images` 只填充独立的 `source_images` 输出，不会改变主 `images`。请将 `source_images` 另接预览或视频合成节点查看；解码失败时运行报告会明确说明，并输出灰色占位而不会冒充生成画面。
+SelfLift 开「空间分块」时又开段间引导 continue（模型级 keep-mask），旧实现会把
+tile 的 latent 乘上**整张画布**的 mask，报
+`The size of tensor a (26) must match the size of tensor b (80) at non-singleton dimension 3`。
+现在分块会把编进 cond 的 mask 一起裁（裁不了就退化为整帧前向并告警，绝不硬乘）。
+细节与规避方式见 [`docs/tiling-denoise-mask.md`](docs/tiling-denoise-mask.md)。
 
 ## 导演包（剧本 + 素材）
 

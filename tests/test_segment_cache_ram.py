@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -98,6 +101,7 @@ class RamKeyTests(unittest.TestCase):
 class RamStoreTests(unittest.TestCase):
     def setUp(self):
         ram.reset()
+        ram.disable_spill()
         ram.set_budget_bytes(1024 * 1024)
         self.root = ram.root_for("ram:57")
         self.addCleanup(ram.reset)
@@ -236,19 +240,23 @@ class RamStoreTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # segment_cache plumbing (torch / folder_paths stubbed)
 # --------------------------------------------------------------------------- #
-def _build_stub_modules() -> dict[str, types.ModuleType]:
+def _build_stub_modules(output_dir: str) -> dict[str, types.ModuleType]:
     torch = types.ModuleType("torch")
     torch.Tensor = FakeTensor
     torch.uint8 = "uint8"
 
-    def _unsupported(*_args, **_kwargs):
-        raise AssertionError("disk torch I/O is not exercised by this test")
+    def _save(payload, path, *_args, **_kwargs):
+        # Only the spill sink writes to disk here; a marker is enough to prove it.
+        Path(path).write_bytes(b"STUB" + repr(payload).encode("utf-8", "ignore"))
 
-    torch.save = _unsupported
+    def _unsupported(*_args, **_kwargs):
+        raise AssertionError("disk torch load is not exercised by this test")
+
+    torch.save = _save
     torch.load = _unsupported
 
     folder_paths = types.ModuleType("folder_paths")
-    folder_paths.get_output_directory = lambda: str(Path("/tmp/mmx-test-output"))
+    folder_paths.get_output_directory = lambda: output_dir
 
     frames = types.ModuleType("mmxplugin.lib.frames_ffv1")
     frames.FRAMES_SUFFIX = ".frames.mkv"
@@ -310,7 +318,8 @@ class SegmentCacheRamPlumbingTests(unittest.TestCase):
             package = types.ModuleType(name)
             package.__path__ = [str(path)]
             sys.modules[name] = package
-        sys.modules.update(_build_stub_modules())
+        cls._outdir = tempfile.mkdtemp(prefix="mmx-cache-out-")
+        sys.modules.update(_build_stub_modules(cls._outdir))
 
         spec = importlib.util.spec_from_file_location(
             "mmxplugin.director.segment_cache",
@@ -337,6 +346,7 @@ class SegmentCacheRamPlumbingTests(unittest.TestCase):
         # store under test here is *its* module, not the top-level import above.
         self.ram = self.sc._ramcache
         self.ram.reset()
+        self.ram.disable_spill()
         # Real payloads (154 MB frames / 13 MB latents) must not be evicted here.
         self.ram.set_budget_bytes(4 * 1024 ** 3)
 
@@ -428,6 +438,42 @@ class SegmentCacheRamPlumbingTests(unittest.TestCase):
         self.assertEqual(removed, 4)
         self.assertEqual(list(root.iterdir()), [])
 
+    def test_clear_on_a_ram_key_also_drops_the_disk_mirror(self):
+        key = self.sc.resolve_segment_cache_key("", "57", backend="ram")
+        mirror = Path(self._outdir) / "minimax_seg_cache" / "57"
+        mirror.mkdir(parents=True, exist_ok=True)
+        (mirror / "seg_0000.pt").write_text("spilled", encoding="utf-8")
+        root = self.sc._cache_root(key)
+        (root / "seg_0000.pt").set_object(FakeTensor((4,), "uint8"))
+
+        removed = self.sc.clear_segment_cache(key, kind="final")
+
+        self.assertEqual(removed, 2)
+        self.assertFalse((mirror / "seg_0000.pt").exists())
+        self.assertEqual(list(root.iterdir()), [])
+
+    def test_spill_writes_real_disk_files_under_the_base_key(self):
+        key = self.sc.resolve_segment_cache_key("", "57", backend="ram")
+        self.sc.set_ram_spill(True)
+        self.addCleanup(self.sc.set_ram_spill, False)
+        root = self.sc._cache_root(key)
+        (root / "seg_0000.meta.json").write_text('{"seed": 1}', encoding="utf-8")
+        (root / "seg_0000.av.pt").set_object({"samples": FakeTensor((2,), "float32")})
+
+        mirror = Path(self._outdir) / "minimax_seg_cache" / "57"
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if (mirror / "seg_0000.meta.json").exists() and (
+                mirror / "seg_0000.av.pt"
+            ).exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue((mirror / "seg_0000.meta.json").is_file())
+        self.assertEqual(
+            (mirror / "seg_0000.meta.json").read_text(encoding="utf-8"), '{"seed": 1}'
+        )
+        self.assertTrue((mirror / "seg_0000.av.pt").is_file())
+
     def test_first_pass_signature_changes_after_write(self):
         key = self.sc.resolve_segment_cache_key("", "57", backend="ram")
         before = self.sc.first_pass_cache_disk_signature(key)
@@ -441,6 +487,73 @@ class SegmentCacheRamPlumbingTests(unittest.TestCase):
         self.assertNotEqual(before, after)
         # sorted() over slots must work (pathlib sorts by parts).
         self.assertLess(after.index("seg_0000"), after.index("seg_0001"))
+
+
+class RamSpillTests(unittest.TestCase):
+    """Write-behind: RAM reads, background disk mirror."""
+
+    def setUp(self):
+        ram.reset()
+        ram.set_budget_bytes(64 * 1024 * 1024)
+        ram.disable_spill()
+        self.root = ram.root_for("ram:hero_57")
+        self.addCleanup(ram.reset)
+        self.addCleanup(ram.disable_spill)
+
+    def test_spill_is_off_until_enabled(self):
+        self.assertFalse(ram.spill_enabled())
+        (self.root / "seg_0000.pt").set_object(FakeTensor((4,), "uint8"))
+        self.assertEqual(ram.spill_stats()["pending"], 0)
+
+    def test_spill_mirrors_writes_under_the_base_key(self):
+        written = []
+        done = threading.Event()
+
+        def sink(base, name, payload, is_text):
+            written.append((base, name, is_text))
+            if len(written) >= 3:
+                done.set()
+
+        ram.enable_spill(sink, max_pending=8)
+        (self.root / "seg_0000.meta.json").write_text("{}", encoding="utf-8")
+        (self.root / "seg_0000.pt").set_object(FakeTensor((4,), "uint8"))
+        (self.root / "seg_0000.av.pt").set_object({"samples": FakeTensor((2,), "uint8")})
+        self.assertTrue(done.wait(5), "spill worker did not drain the queue")
+        self.assertEqual(
+            set(written),
+            {
+                ("hero_57", "seg_0000.meta.json", True),
+                ("hero_57", "seg_0000.pt", False),
+                ("hero_57", "seg_0000.av.pt", False),
+            },
+        )
+
+    def test_full_queue_drops_instead_of_blocking_generation(self):
+        gate = threading.Event()
+
+        def sink(base, name, payload, is_text):
+            gate.wait(5)
+
+        ram.enable_spill(sink, max_pending=1)
+        for idx in range(6):
+            (self.root / f"seg_{idx:04d}.pt").set_object(FakeTensor((4,), "uint8"))
+        self.assertGreaterEqual(ram.spill_stats()["dropped"], 1)
+        gate.set()
+        ram.disable_spill()
+
+    def test_spill_does_not_block_reads_or_writes(self):
+        gate = threading.Event()
+
+        def sink(base, name, payload, is_text):
+            gate.wait(5)
+
+        ram.enable_spill(sink, max_pending=2)
+        (self.root / "seg_0000.pt").set_object(FakeTensor((4,), "uint8"))
+        # RAM read must still answer while the worker is stuck in the sink.
+        self.assertTrue((self.root / "seg_0000.pt").is_file())
+        self.assertIsNotNone((self.root / "seg_0000.pt").get_object())
+        gate.set()
+        ram.disable_spill()
 
 
 if __name__ == "__main__":

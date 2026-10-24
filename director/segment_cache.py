@@ -479,6 +479,32 @@ def _load_torch(path: Any, *, weights_only: bool = False, clone: bool = True) ->
     return torch.load(path, map_location="cpu", weights_only=weights_only)
 
 
+def _spill_to_disk(base_key: str, name: str, payload: Any, is_text: bool) -> None:
+    """Write-behind sink for the RAM store (runs on its worker thread).
+
+    Persists one RAM slot into ``output/minimax_seg_cache/<base_key>/<name>`` —
+    the very directory the plain Director uses — so a later process (or the disk
+    node) can reuse it. Frames land as the raw uint8 ``.pt`` payload regardless of
+    ``cache_frames_codec``: the RAM store never encoded them, and the disk reader
+    accepts either format.
+    """
+    root = _cache_dir(base_key)
+    root.mkdir(parents=True, exist_ok=True)
+    dest = root / name
+    if is_text:
+        _write_via_temp(dest, lambda p: p.write_text(str(payload), encoding="utf-8"))
+    else:
+        _write_via_temp(dest, lambda p: torch.save(payload, p))
+
+
+def set_ram_spill(enabled: bool) -> None:
+    """Enable/disable the background disk mirror of the RAM store."""
+    if enabled:
+        _ramcache.enable_spill(_spill_to_disk)
+    else:
+        _ramcache.disable_spill()
+
+
 def _audio_payload_to_cpu(audio: dict[str, Any] | None) -> dict[str, Any] | None:
     """Normalize export AUDIO dict for disk cache (waveform on CPU)."""
     if not isinstance(audio, dict):
@@ -1258,6 +1284,11 @@ def prune_segment_cache(node_id: str | None, valid_indices) -> None:
     """
     if not node_id:
         return
+    if _ramcache.is_ram_key(node_id):
+        # Keep the write-behind mirror (plain key) from keeping deleted slots alive.
+        base = _ramcache.base_key(node_id)
+        if base:
+            prune_segment_cache(base, valid_indices)
     try:
         root = _cache_dir_or_none(node_id)
         if root is None or not root.is_dir():
@@ -1867,14 +1898,19 @@ def clear_segment_cache(node_id: str | None, kind: str = "final") -> int:
         return 0
     if kind not in {"first_pass", "final", "all"}:
         raise ValueError("kind must be first_pass, final or all")
+    removed = 0
+    if _ramcache.is_ram_key(node_id):
+        # RAM node: also drop the disk mirror left by the write-behind spill.
+        base = _ramcache.base_key(node_id)
+        if base:
+            removed += clear_segment_cache(base, kind=kind)
     root = _cache_dir_or_none(node_id)
     if root is None or not root.is_dir():
-        return 0
+        return removed
     try:
         entries = list(root.iterdir())
     except OSError:
-        return 0
-    removed = 0
+        return removed
     for path in entries:
         try:
             if not path.is_file():

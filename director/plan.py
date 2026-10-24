@@ -286,6 +286,9 @@ class DirectorPlan:
     # in-process store in director/segment_cache_ram.py (opt-in node).
     cache_backend: str = "disk"
     ram_cache_gb: int = 0  # 0 = use the RAM store default / env
+    # RAM backend only: mirror writes to output/minimax_seg_cache/ in the
+    # background so a restart can still reuse them (see set_ram_spill).
+    ram_cache_spill: bool = False
     run_indices: frozenset[int] | None = None  # None = run all segments
     continuity_enabled: bool = False
     continuity_overlap_frames: int = 0

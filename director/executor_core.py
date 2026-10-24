@@ -84,6 +84,7 @@ from .segment_cache import (
     resolve_segment_cache_key,
     save_first_pass_cache,
     save_segment_cache,
+    set_ram_spill,
 )
 from .segment_mp4_export import (
     copy_segment_mp4_suffix,
@@ -454,6 +455,11 @@ def execute_director_plan_core(
     if ram_staging:
         plan.cache_frames_codec = "raw"  # RAM stores live tensors: no codec involved
         ram_cache.configure(getattr(plan, "ram_cache_gb", 0))
+        # Optional write-behind: reads stay in RAM, writes are mirrored to disk
+        # by a background thread so a restart can resume where this run stopped.
+        set_ram_spill(bool(getattr(plan, "ram_cache_spill", False)))
+    else:
+        set_ram_spill(False)
     plan.sample_seed = int(seed)
     plan.sample_cfg = float(cfg)
     plan.sample_steps = int(steps)
@@ -524,10 +530,17 @@ def execute_director_plan_core(
         reports.append(f"Segment mp4 export dir: {mp4_run_dir}")
     if ram_staging:
         _ram_stats = ram_cache.stats()
+        _spill = ram_cache.spill_stats()
         reports.append(
             f"Staging: 内存暂存（RAM）— 预算 {_ram_stats['budget_gb']} GB，"
             f"已用 {_ram_stats['bytes'] / (1024 ** 3):.2f} GB / "
-            f"{_ram_stats['entries']} 个文件。进程退出即失效；帧编码选项不适用。"
+            f"{_ram_stats['entries']} 个文件。"
+            + (
+                "同时后台落盘（关掉 ComfyUI 还能续跑，读仍走内存）。"
+                if _spill["enabled"]
+                else "纯内存，进程退出即失效。"
+            )
+            + "帧编码选项不适用。"
         )
     if live_tae_preview:
         reports.append("Live preview: ON — 采样中 TAE 动态预览（成片看下游 CreateVideo / SaveVideo）。")

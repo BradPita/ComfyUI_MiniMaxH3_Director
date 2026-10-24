@@ -52,6 +52,8 @@ class MiniMaxH3Director:
     CACHE_BACKEND = "disk"
     # RAM staging budget in GiB; 0 = env / default (only used when CACHE_BACKEND="ram").
     RAM_CACHE_BUDGET_GB = 0
+    # RAM staging: mirror writes to disk in the background (cross-restart reuse).
+    RAM_CACHE_SPILL = False
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -351,6 +353,7 @@ class MiniMaxH3Director:
             "ram" if str(getattr(self, "CACHE_BACKEND", "disk")).lower() == "ram" else "disk"
         )
         plan.ram_cache_gb = max(0, int(getattr(self, "RAM_CACHE_BUDGET_GB", 0) or 0))
+        plan.ram_cache_spill = bool(getattr(self, "RAM_CACHE_SPILL", False))
 
         try:
             combined, segment_outputs, segment_audios, report, export_frame_counts, pre_combined, pre_segments, held_for_confirmation, pre_face_combined, pre_face_segments = (

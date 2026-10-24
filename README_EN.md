@@ -71,6 +71,15 @@ See [`docs/ram-cache.md`](docs/ram-cache.md) for the cost model and A/B setup.
   continuity / refine read-back. For an overall speed-up change steps,
   resolution or the refine strategy instead.
 
+### Spatial tiling + continuity keep-mask (fixed)
+
+With SelfLift tiling on *and* a continuity continue prefix (a model-level
+keep-mask), the tiler used to multiply a tile latent by a **full-canvas** mask:
+`The size of tensor a (26) must match the size of tensor b (80) at non-singleton
+dimension 3`. The cond-level mask is now cropped with the latent (and the pass
+falls back to a full-frame forward with a warning instead of multiplying a
+mismatched mask). See [`docs/tiling-denoise-mask.md`](docs/tiling-denoise-mask.md).
+
 ## Director pack (script + media)
 
 Toolbar **Import pack / Export pack** writes `*.mmxpack.zip`. Paths are ASCII only and match the English UI (independent of the current UI language).
