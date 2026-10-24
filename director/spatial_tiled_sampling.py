@@ -148,6 +148,47 @@ def _crop_matching_video(tensor, full_h: int, full_w: int, axis: str, start: int
     return cropped
 
 
+class _TileMaskMisaligned(RuntimeError):
+    """A model-level denoise mask cannot be cropped to one tile.
+
+    Raised instead of silently forwarding a full-canvas mask into a tile
+    forward, which is what crashes H3 with
+    "The size of tensor a (26) must match the size of tensor b (80)".
+    """
+
+
+def _crop_video_mask(mask, axis: str, start: int, end: int, *, full_h: int, full_w: int):
+    """Crop a model-level video denoise mask to one tile. Returns ``(mask, cropped)``.
+
+    ComfyUI bakes the per-step mask into the conditioning once
+    (``process_conds`` → ``MiniMaxH3.extra_conds`` → ``_denoise_mask_conds``),
+    where the packed AV mask is unpacked and the model receives a
+    ``(B, 1, T, H, W)`` video mask on the **full canvas**. H3's forward then does
+    ``out[0] * denoise_mask`` and derives per-row timesteps from it, so a tile
+    forward needs this cond mask cropped exactly like the latent — cropping only
+    the mask passed to the inpaint wrapper is not enough.
+
+    ``cropped`` is False when the tensor is not a full-canvas video mask; the
+    caller must then refuse to tile rather than guess.
+    """
+    if not torch.is_tensor(mask):
+        return mask, False
+    work = mask
+    squeezed = False
+    if work.ndim == 4:  # (B, T, H, W) — same spatial tail as the 5D form
+        work = work.unsqueeze(1)
+        squeezed = True
+    if work.ndim != 5:
+        return mask, False
+    if (int(work.shape[-2]), int(work.shape[-1])) != (int(full_h), int(full_w)):
+        return mask, False
+    cropped = _crop_spatial_5d(work, axis, start, end)
+    cropped, _, _ = _pad_even_hw(cropped)
+    if squeezed:
+        cropped = cropped.squeeze(1)
+    return cropped, True
+
+
 def _crop_ref_block(blk, full_h: int, full_w: int, axis: str, start: int, end: int):
     """Crop a PackedLayout ref whose latent sits on the generate canvas.
 
@@ -279,6 +320,24 @@ def _install_tile_payloads(cfg_guider, *, axis: str, start: int, end: int, tile_
         if shape_cond is not None and hasattr(shape_cond, "cond"):
             restorations.append((shape_cond, "cond", shape_cond.cond))
             shape_cond.cond = tile_shapes
+
+        # The model-level mask is baked into the cond on the full canvas; H3
+        # multiplies the tile latent by it (and reads per-row timesteps from it),
+        # so it has to travel with the crop. Audio is not tiled — leave it.
+        mask_cond = model_conds.get("denoise_mask")
+        mask = getattr(mask_cond, "cond", None) if mask_cond is not None else None
+        if mask is not None:
+            cropped_mask, did_crop = _crop_video_mask(
+                mask, axis, start, end, full_h=full_h, full_w=full_w
+            )
+            if not did_crop:
+                raise _TileMaskMisaligned(
+                    f"denoise_mask {tuple(getattr(mask, 'shape', ()))} does not match the "
+                    f"{full_h}x{full_w} canvas (axis={axis} {start}:{end})"
+                )
+            if cropped_mask is not mask:
+                restorations.append((mask_cond, "cond", mask))
+                mask_cond.cond = cropped_mask
 
         payload_cond = model_conds.get("minimax_payload")
         payload = getattr(payload_cond, "cond", None) if payload_cond is not None else None
@@ -423,6 +482,11 @@ def _tiled_model_call(
             )
     if plan is None:
         return _invoke_model(model_k, x, sigma, denoise_mask, call_kw)
+    if plan.get("disabled"):
+        # A previous step proved tiles cannot be kept consistent (e.g. a
+        # model-level denoise mask that does not travel with the crop). Every
+        # later step of this pass must stay full-frame instead of retrying.
+        return _invoke_model(model_k, x, sigma, denoise_mask, call_kw)
 
     axis = plan["axis"]
     full_h = int(video.shape[-2])
@@ -443,7 +507,21 @@ def _tiled_model_call(
             tile_x, tile_shapes, (pad_h, pad_w) = _crop_packed(x, full_shapes, axis, ax_start, ax_end)
             tile_mask = None
             if denoise_mask is not None:
-                tile_mask, _, _ = _crop_packed(denoise_mask, full_shapes, axis, ax_start, ax_end)
+                try:
+                    tile_mask, _, _ = _crop_packed(
+                        denoise_mask, full_shapes, axis, ax_start, ax_end
+                    )
+                except Exception as exc:
+                    # Same class of bug as a cond mask that cannot be cropped: a
+                    # full-canvas mask must never ride into a tile forward.
+                    plan["disabled"] = True
+                    log.warning(
+                        "spatial tiling disabled for this pass: sampler denoise_mask %s "
+                        "cannot be cropped (%s); using a full-frame forward.",
+                        tuple(getattr(denoise_mask, "shape", ())),
+                        exc,
+                    )
+                    return _invoke_model(model_k, x, sigma, denoise_mask, call_kw)
             if saved_latent_image is not None:
                 model_k.latent_image, _, _ = _crop_packed(
                     saved_latent_image, full_shapes, axis, ax_start, ax_end
@@ -466,10 +544,24 @@ def _tiled_model_call(
                 base.latent_shapes = saved_shapes
                 model_k.latent_image = saved_latent_image
                 model_k.noise = saved_noise
-                log.warning(
-                    "spatial tile layout failed (%s); this step uses a full-frame forward",
-                    exc,
-                )
+                if isinstance(exc, _TileMaskMisaligned):
+                    # Tiling and a model-level denoise mask (段间引导 continue
+                    # remask / SelfLift「native inpaint」keep-mask) are only
+                    # compatible when the mask can be cropped with the latent.
+                    # Refuse to tile for the rest of this pass: a full-frame
+                    # forward is slower but correct, a mismatched mask is a crash.
+                    plan["disabled"] = True
+                    log.warning(
+                        "spatial tiling disabled for this pass: %s. "
+                        "改用整帧前向（更慢但不报错）；要回分块请关掉段间引导的 keep-mask"
+                        "（SelfLift 的「HQ resume/原生 inpaint」）或降低画布。",
+                        exc,
+                    )
+                else:
+                    log.warning(
+                        "spatial tile layout failed (%s); this step uses a full-frame forward",
+                        exc,
+                    )
                 return _invoke_model(model_k, x, sigma, denoise_mask, call_kw)
             base.latent_shapes = tile_shapes
             try:
